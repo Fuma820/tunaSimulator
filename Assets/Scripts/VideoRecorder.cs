@@ -8,23 +8,17 @@ using UnityEngine.Networking;
 
 public class VideoRecorder : MonoBehaviour
 {
-    [Header("Recording Settings")]
-    [SerializeField, Tooltip("出力動画のフレームレート（FFmpegに渡す入力フレームレート）。実行時のフレームレートとは独立して30FPSなどに固定できます。")]
-    private int recordingFrameRate = 15;          // 出力動画のフレームレート（エンコード時）
-    [SerializeField, Tooltip("動画の目的秒数。stepSynchronousRecording時の保存枚数は recordingFrameRate × recordingDuration で自動算出します。")]
-    private float recordingDuration = 5f;        // 録画時間（秒）
-    private int recordingInterval = 1;          // 録画間隔（エピソード数）
-    private string outputDirectory = "Recordings"; // 出力ディレクトリ
-    [SerializeField, Tooltip("ステップ同期録画（各フレーム=各計算ステップをすべて保存）。StopRecording() が呼ばれるまで毎フレーム保存します。")]
-    private bool stepSynchronousRecording = true;
-    // stepSyncMaxFrames は recordingFrameRate × recordingDuration で自動算出します（0 以下で無制限にしたい場合は recordingDuration <= 0 か recordingFrameRate <= 0 に設定）
-    // タイムスケール関連の強制は行わない（録画は実時間ベースで進行）
+    [SerializeField] private int recordingFrameRate = 15;               // 出力動画のフレームレート
+    [SerializeField] private float recordingDuration = 5f;              // 録画時間
+    private int recordingInterval = 1;                                  // 録画間隔
+    private string outputDirectory = "Recordings";                      // 出力ディレクトリ
+    [SerializeField] private bool stepSynchronousRecording = true;
 
     private bool isRecording = false;
-    private int currentEpisode = 0;       // 実際のエピソード番号（NotifyEpisodeBeginで加算）
-    private static int globalEpisodeCounter = 0;  // 全エージェント共通のグローバルエピソードカウンター
-    private int lastRecordedEpisode = 0;  // 最後に録画したエピソード番号
-    private int activeRecordingEpisodeNumber = -1; // 現在録画中のエピソード番号（手動停止時に使用）
+    private int currentEpisode = 0;
+    private static int globalEpisodeCounter = 0;
+    private int lastRecordedEpisode = 0;                                // 最後に録画したエピソード番号
+    private int activeRecordingEpisodeNumber = -1;                      // 現在録画中のエピソード番号
     private Coroutine recordingCoroutine;
     private string activeEpisodeFolder;
     private int activeFrameIndex;
@@ -33,42 +27,32 @@ public class VideoRecorder : MonoBehaviour
     private Texture2D readbackTexture;
     private bool captureFramerateLocked;
     private int previousCaptureFramerate;
-    // タイムスケールの保存/復帰は行わない
 
-    [Header("Camera Settings")]
-    public Camera recordingCamera;               // 録画用カメラ
-    public int recordingWidth = 1920;           // 録画解像度（幅）
-    public int recordingHeight = 1080;          // 録画解像度（高さ）
+    public Camera recordingCamera;
+    public int recordingWidth = 1920;
+    public int recordingHeight = 1080;
 
-    [Header("FFmpeg Encoding")]
-    [SerializeField] private bool autoEncodeToMp4 = true;          // 保存後に自動で動画化する
-    [SerializeField] private string ffmpegExePath = "ffmpeg";       // ffmpeg実行ファイル（PATHにあるなら"ffmpeg"のままで可）
-    [SerializeField] private bool deleteFramesAfterEncode = false;  // 変換成功後にPNGを削除
-    [SerializeField, Tooltip("既存のエピソードフォルダを上書きするかどうか")] private bool overwriteExistingRecordings = true;
-    [SerializeField, Tooltip("録画中は Time.captureFramerate を recordingFrameRate に固定するか")] private bool lockCaptureFramerate = true;
+    [SerializeField] private bool autoEncodeToMp4 = true;               // 保存後に自動で動画化
+    [SerializeField] private string ffmpegExePath = "ffmpeg";           // ffmpeg実行ファイル
+    [SerializeField] private bool deleteFramesAfterEncode = false;      // 変換成功後にPNGを削除
+    [SerializeField] private bool overwriteExistingRecordings = true;
+    [SerializeField] private bool lockCaptureFramerate = true;
 
-    [Header("Recording Persistence")]
-    [SerializeField, Tooltip("サーバーに送信する MP4 を Recordings フォルダ配下にアーカイブ保存するかどうか。")] private bool archiveUploadedVideos = true;
-    [SerializeField, Tooltip("アーカイブを保存するサブフォルダ名（Recordings/以下）")] private string uploadArchiveSubdirectory = "Uploaded";
-    [SerializeField, Tooltip("全てのMP4をひとつのサブフォルダに集約保存するかどうか。")] private bool consolidateVideosIntoSingleFolder = true;
-    [SerializeField, Tooltip("集約保存するサブフォルダ名（Recordings/以下）。空欄で Recordings 直下へ保存。")] private string consolidatedVideoSubfolder = "Videos";
+    [SerializeField] private bool archiveUploadedVideos = true;
+    [SerializeField] private string uploadArchiveSubdirectory = "Uploaded";
+    [SerializeField] private bool consolidateVideosIntoSingleFolder = true;
+    [SerializeField] private string consolidatedVideoSubfolder = "Videos";
 
-    [Header("Server Communication")]
     [SerializeField] private string serverBaseUrl = "http://localhost:8000";
-    [SerializeField] private float serverTimeout = 180f; // Timeout for server requests
+    [SerializeField] private float serverTimeout = 180f;
     [SerializeField] private int maxRetryAttempts = 5;
     [SerializeField] private float retryDelay = 2f;
-    [SerializeField] private bool enableDetailedLogging = false; // デフォルトでログを無効化
-    [SerializeField, Tooltip("Disable to skip uploading recordings to the configured server.")] private bool uploadToServer = true;
+    [SerializeField] private bool enableDetailedLogging = false;
+    [SerializeField] private bool uploadToServer = true;
 
-    // Event for distributing rewards to all agents
     public System.Action<float> OnRewardReceived;
     public System.Action<int, float> OnServerScoreReceived;
-
-    // Public property to access global episode counter
     public static int GlobalEpisodeCounter => globalEpisodeCounter;
-
-    // Event for notifying episode increment
     public static System.Action<int> OnGlobalEpisodeIncremented;
 
     private bool lastUploadSuccess = false;
@@ -133,9 +117,7 @@ public class VideoRecorder : MonoBehaviour
     public float RecordingDurationSeconds => recordingDuration;
     public int RecordingFrameRate => recordingFrameRate;
 
-    /// <summary>
-    /// Override the recording window so external controllers can ensure consistent clip lengths.
-    /// </summary>
+
     public void ConfigureRecordingWindow(float durationSeconds, int frameRate)
     {
         bool changed = false;
@@ -185,21 +167,13 @@ public class VideoRecorder : MonoBehaviour
         return BuildEpisodeBaseName(episodeNumber) + ".mp4";
     }
 
-    /// <summary>
-    /// エピソード開始時に呼び出してください（MultiFishAgent.OnEpisodeBeginから）
-    /// 設定された録画間隔(recordingInterval)ごとに録画を開始します。
-    /// </summary>
     public void NotifyEpisodeBegin()
     {
-        // グローバルエピソードカウンターをインクリメント（最初の呼び出しのみ）
         if (currentEpisode == 0 || currentEpisode == globalEpisodeCounter)
         {
             globalEpisodeCounter++;
             currentEpisode = globalEpisodeCounter;
-            
-            // グローバルエピソード更新ログは削除（通常動作のため不要）
-            
-            // 全エージェントにグローバルエピソード更新を通知
+        
             OnGlobalEpisodeIncremented?.Invoke(globalEpisodeCounter);
         }
         
@@ -214,12 +188,8 @@ public class VideoRecorder : MonoBehaviour
         }
     }
 
-    /// <summary>
-    /// 録画を開始
-    /// </summary>
     public void StartRecording()
     {
-        // 手動強制録画用（GUIボタンなど）。既存の録画や保存処理が完了していることを確認してから開始する。
         if (isRecording || recordingCoroutine != null)
         {
             return;
@@ -233,17 +203,10 @@ public class VideoRecorder : MonoBehaviour
         lastRecordedEpisode = globalEpisodeCounter;
     }
 
-    // 内部ヘルパー：指定のエピソード番号で録画を開始
     private void StartRecordingForEpisode(int episodeNumber)
     {
-        // 録画開始ログは削除（通常動作のため不要）
-
-        // タイムスケールの変更は行わない
-
-        // 既に録画・保存処理中であれば、完了後に開始するよう待機を予約
         if (recordingCoroutine != null)
         {
-            // 録画ビジーログは削除（通常動作のため不要）
             LogStatus($"Recorder busy. Episode {episodeNumber} will start when idle.");
             StartCoroutine(StartWhenIdleAndRecord(episodeNumber));
             return;
@@ -258,7 +221,6 @@ public class VideoRecorder : MonoBehaviour
         recordingCoroutine = StartCoroutine(RecordingCoroutine(episodeNumber));
     }
 
-    // 現在の録画/保存が完了するまで待ってから録画を開始
     private IEnumerator StartWhenIdleAndRecord(int episodeNumber)
     {
         while (recordingCoroutine != null)
@@ -296,9 +258,6 @@ public class VideoRecorder : MonoBehaviour
         captureFramerateLocked = false;
     }
 
-    /// <summary>
-    /// 録画処理のコルーチン（指定時間録画）
-    /// </summary>
     private IEnumerator RecordingCoroutine(int episodeNumber)
     {
             if (string.IsNullOrEmpty(activeEpisodeFolder))
@@ -340,7 +299,6 @@ public class VideoRecorder : MonoBehaviour
                         break;
                     }
 
-                    // capture lock advances game time at the target FPS, so no extra waiting needed
                     continue;
                 }
 
@@ -397,7 +355,6 @@ public class VideoRecorder : MonoBehaviour
 
             activeRecordingEpisodeNumber = -1;
             isRecording = false;
-            // 録画完了ログは削除（通常動作のため不要）
             recordingCoroutine = null;
             activeEpisodeFolder = null;
                 RestoreCaptureFramerate();
@@ -459,7 +416,6 @@ public class VideoRecorder : MonoBehaviour
             return resolvedFfmpegExecutablePath;
         }
 
-        // First try the user-provided path
         if (!string.IsNullOrWhiteSpace(ffmpegExePath))
         {
             string trimmed = ffmpegExePath.Trim();
@@ -556,8 +512,7 @@ public class VideoRecorder : MonoBehaviour
 
     private static IEnumerable<string> GetDefaultFfmpegSearchPaths()
     {
-        // Common install locations for ffmpeg across OSes
-        yield return "/opt/homebrew/bin/ffmpeg";        // Apple Silicon Homebrew
+        yield return "/opt/homebrew/bin/ffmpeg";       // Apple Silicon Homebrew
         yield return "/usr/local/bin/ffmpeg";          // Intel Homebrew / macOS
         yield return "/usr/bin/ffmpeg";                // Linux standard package
         string programFiles = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
@@ -605,11 +560,7 @@ public class VideoRecorder : MonoBehaviour
             yield return StartCoroutine(EncodeToMp4Coroutine(activeEpisodeFolder, episodeNumber));
         }
     }
-    // Upload (and reward handling) is intentionally not implemented here to avoid duplication with MultiFishAgent.
-
-    /// <summary>
-    /// フレームをキャプチャしてリストに追加
-    /// </summary>
+   
     private void CaptureFrame()
     {
         if (recordingCamera == null)
@@ -621,19 +572,16 @@ public class VideoRecorder : MonoBehaviour
 
         EnsureCaptureResources();
 
-        // RenderTextureを作成
         RenderTexture currentRT = RenderTexture.active;
         recordingCamera.targetTexture = captureRenderTexture;
         recordingCamera.Render();
 
-        // RenderTextureからTexture2Dに変換
         RenderTexture.active = captureRenderTexture;
         readbackTexture.ReadPixels(new Rect(0, 0, recordingWidth, recordingHeight), 0, 0);
         readbackTexture.Apply(false);
 
         SaveFrameTexture(readbackTexture);
 
-        // クリーンアップ
         recordingCamera.targetTexture = null;
         RenderTexture.active = currentRT;
     }
@@ -745,9 +693,6 @@ public class VideoRecorder : MonoBehaviour
             }
         }
 
-    /// <summary>
-    /// ファイル書き込みをリトライ機能付きで実行
-    /// </summary>
     private IEnumerator WriteFileWithRetry(string filePath, byte[] data, int maxRetries)
     {
         for (int attempt = 0; attempt < maxRetries; attempt++)
@@ -755,10 +700,8 @@ public class VideoRecorder : MonoBehaviour
             bool success = false;
             string errorMessage = "";
             
-            // ファイルアクセス待機は try-catch の外で実行
             if (File.Exists(filePath))
             {
-                // 既存ファイルがロックされていないかチェック
                 yield return StartCoroutine(WaitForFileAccess(filePath, 2.0f));
             }
             
@@ -766,13 +709,10 @@ public class VideoRecorder : MonoBehaviour
             {
                 File.WriteAllBytes(filePath, data);
                 success = true;
-                
-                // ファイル書き込み成功ログは削除（通常動作のため不要）
             }
             catch (System.IO.IOException ex)
             {
                 errorMessage = ex.Message;
-                // ファイル書き込み失敗の個別ログは削除（最終結果のみログ出力）
             }
             catch (System.Exception ex)
             {
@@ -783,12 +723,11 @@ public class VideoRecorder : MonoBehaviour
             
             if (success)
             {
-                yield break; // 成功したら終了
+                yield break;
             }
             
             if (attempt < maxRetries - 1)
             {
-                // 次の試行前に少し待機
                 yield return new WaitForSeconds(0.5f + attempt * 0.5f);
             }
             else
@@ -798,9 +737,6 @@ public class VideoRecorder : MonoBehaviour
         }
     }
 
-    /// <summary>
-    /// ファイルアクセス可能になるまで待機
-    /// </summary>
     private IEnumerator WaitForFileAccess(string filePath, float timeoutSeconds)
     {
         float startTime = Time.realtimeSinceStartup;
@@ -811,16 +747,13 @@ public class VideoRecorder : MonoBehaviour
             
             try
             {
-                // ファイルが使用可能かテスト
                 using (FileStream fs = File.Open(filePath, FileMode.OpenOrCreate, FileAccess.Write, FileShare.None))
                 {
-                    // ファイルにアクセス可能
                     canAccess = true;
                 }
             }
             catch (System.IO.IOException)
             {
-                // ファイルが使用中
                 canAccess = false;
             }
             
@@ -836,7 +769,7 @@ public class VideoRecorder : MonoBehaviour
     }
 
     /// <summary>
-    /// FFmpegでPNGからMP4を作成する
+    /// FFmpegでPNGからMP4を作成
     /// </summary>
     private IEnumerator EncodeToMp4Coroutine(string episodeFolder, int episodeNumber)
     {
@@ -850,15 +783,12 @@ public class VideoRecorder : MonoBehaviour
             yield break;
         }
 
-        // 既存のMP4ファイルがある場合は削除を試行
         if (File.Exists(outputMp4))
         {
             yield return StartCoroutine(DeleteFileWithRetry(outputMp4, 5));
-            // ファイル削除後、確実にアクセス可能になるまで待機
             yield return StartCoroutine(WaitForFileAccess(outputMp4, 3.0f));
         }
 
-        // 一時的なファイルロックがないことを確認
         yield return new WaitForSeconds(0.2f);
 
         var psi = new System.Diagnostics.ProcessStartInfo
@@ -872,7 +802,6 @@ public class VideoRecorder : MonoBehaviour
             WorkingDirectory = episodeFolder
         };
 
-        // ここでプロセス起動時の例外を吸収（catchはコルーチン外のヘルパーで）
         System.Diagnostics.Process proc;
         string startError;
         if (!TryStartExternalProcess(psi, out proc, out startError))
@@ -883,9 +812,8 @@ public class VideoRecorder : MonoBehaviour
 
         try
         {
-            // 完了待ち（非ブロッキングに1フレームずつ待機）
             float startTime = Time.realtimeSinceStartup;
-            float timeout = 60f; // 60秒タイムアウト
+            float timeout = 60f;
             
             while (!proc.HasExited)
             {
@@ -907,10 +835,8 @@ public class VideoRecorder : MonoBehaviour
 
             if (proc.ExitCode == 0)
             {
-                // FFmpeg成功ログは削除（通常動作のため不要）
                 LogStatus($"Episode {episodeNumber} encoded successfully.");
                 
-                // ファイルが確実に作成されるまで少し待機
                 yield return new WaitForSeconds(0.5f);
                 
                 if (deleteFramesAfterEncode)
@@ -931,7 +857,6 @@ public class VideoRecorder : MonoBehaviour
                 // エンコード成功を通知
                 OnMp4Encoded?.Invoke(finalOutputPath, episodeNumber, true);
                 
-                // Upload to server and distribute reward when enabled
                 if (uploadToServer)
                 {
                     StartCoroutine(UploadVideoToServer(finalOutputPath, episodeNumber));
@@ -939,7 +864,6 @@ public class VideoRecorder : MonoBehaviour
             }
             else
             {
-                // FFmpegの標準エラー出力を取得してログに出力
                 string errorOutput = "";
                 try
                 {
@@ -953,7 +877,6 @@ public class VideoRecorder : MonoBehaviour
                 Debug.LogError($"FFmpeg failed with exit code {proc.ExitCode}. Error output: {errorOutput}");
                 LogStatus($"Episode {episodeNumber} encoding failed (exit {proc.ExitCode}).");
                 
-                // ファイルアクセス関連のエラーかチェック
                 if (errorOutput.Contains("device file") || errorOutput.Contains("access") || errorOutput.Contains("使用中"))
                 {
                     Debug.LogWarning("File access conflict detected. Retrying may resolve the issue.");
@@ -983,9 +906,6 @@ public class VideoRecorder : MonoBehaviour
         }
     }
 
-    /// <summary>
-    /// ファイル削除をリトライ機能付きで実行
-    /// </summary>
     private IEnumerator DeleteFileWithRetry(string filePath, int maxRetries)
     {
         for (int attempt = 0; attempt < maxRetries; attempt++)
@@ -998,19 +918,17 @@ public class VideoRecorder : MonoBehaviour
                 if (File.Exists(filePath))
                 {
                     File.Delete(filePath);
-                    // ファイル削除成功ログは削除（通常動作のため不要）
                 }
                 success = true;
             }
             catch (System.IO.IOException ex)
             {
                 errorMessage = ex.Message;
-                // ファイル削除失敗の個別ログは削除（最終結果のみログ出力）
             }
             
             if (success)
             {
-                yield break; // 成功したら終了
+                yield break;
             }
             
             if (attempt < maxRetries - 1)
@@ -1024,9 +942,6 @@ public class VideoRecorder : MonoBehaviour
         }
     }
 
-    /// <summary>
-    /// フレームファイルのクリーンアップ
-    /// </summary>
     private IEnumerator CleanupFrameFiles(string episodeFolder)
     {
         var frameFiles = Directory.GetFiles(episodeFolder, "frame_*.png");
@@ -1057,8 +972,6 @@ public class VideoRecorder : MonoBehaviour
                 }
             }
         }
-        
-        // クリーンアップ完了ログは削除（通常動作のため不要）
     }
 
     private string TryRelocateVideoToConsolidatedFolder(string sourcePath)
@@ -1110,9 +1023,6 @@ public class VideoRecorder : MonoBehaviour
         }
     }
 
-    /// <summary>
-    /// 例外を内部で捕捉して外部プロセスを起動（CS1626回避のため、yieldを含まないヘルパー）
-    /// </summary>
     private bool TryStartExternalProcess(System.Diagnostics.ProcessStartInfo psi, out System.Diagnostics.Process proc, out string error)
     {
         proc = null;
@@ -1136,9 +1046,6 @@ public class VideoRecorder : MonoBehaviour
         }
     }
 
-    /// <summary>
-    /// 手動で録画を停止
-    /// </summary>
     public void StopRecording()
     {
         if (!isRecording) return;
@@ -1147,34 +1054,26 @@ public class VideoRecorder : MonoBehaviour
 
     void OnDestroy()
     {
-        // アクティブな録画を停止
         if (isRecording)
         {
             isRecording = false;
         }
 
-        // アクティブなコルーチンを停止
         if (recordingCoroutine != null)
         {
             StopCoroutine(recordingCoroutine);
             recordingCoroutine = null;
         }
 
-        // 実行中のFFmpegプロセスがあれば終了を試行
-        System.GC.Collect(); // ガベージコレクションを強制実行してファイルハンドルを解放
+        System.GC.Collect();
 
         CleanupCaptureResources();
         RestoreCaptureFramerate();
         sessionHasRecording = false;
     }
 
-    // Debug OnGUI removed for production simplicity.
-
     #region Server Communication
 
-    /// <summary>
-    /// Upload video to server and distribute reward to all agents
-    /// </summary>
     private IEnumerator UploadVideoToServer(string videoPath, int episodeNumber)
     {
         if (enableDetailedLogging)
@@ -1186,7 +1085,6 @@ public class VideoRecorder : MonoBehaviour
             LogStatus($"Uploading episode {episodeNumber} to server...");
         }
 
-        // Check if file exists
         if (!File.Exists(videoPath))
         {
             Debug.LogError($"[VideoRecorder] Video file not found: {videoPath}");
@@ -1195,7 +1093,6 @@ public class VideoRecorder : MonoBehaviour
 
         PersistUploadedVideo(videoPath, episodeNumber);
 
-        // Read video file
         byte[] videoData;
         try
         {
@@ -1211,7 +1108,6 @@ public class VideoRecorder : MonoBehaviour
             yield break;
         }
 
-        // Attempt upload with retries
         for (int attempt = 1; attempt <= maxRetryAttempts; attempt++)
         {
             if (enableDetailedLogging)
@@ -1233,7 +1129,7 @@ public class VideoRecorder : MonoBehaviour
 
             if (lastUploadSuccess)
             {
-                break; // Success, exit retry loop
+                break;
             }
 
             if (attempt < maxRetryAttempts)
@@ -1252,16 +1148,12 @@ public class VideoRecorder : MonoBehaviour
         }
     }
 
-    /// <summary>
-    /// Single upload attempt
-    /// </summary>
     private IEnumerator TryUploadVideo(byte[] videoData, int episodeNumber, int attemptNumber, string uploadFileName)
     {
         lastUploadSuccess = false;
 
-        string url = $"{serverBaseUrl}/upload/video"; // 正しいエンドポイント
+        string url = $"{serverBaseUrl}/upload/video";
 
-        // Create form data - サーバーの期待する形式に合わせる
         WWWForm form = new WWWForm();
         form.AddBinaryData("file", videoData, uploadFileName, "video/mp4");
         form.AddField("episode_number", episodeNumber.ToString());
@@ -1284,9 +1176,7 @@ public class VideoRecorder : MonoBehaviour
                 try
                 {
                     string responseText = request.downloadHandler.text;
-                    // サーバーレスポンスログは削除（通常動作のため不要）
 
-                    // Parse JSON response - サーバーの実際のレスポンス形式に合わせる
                     var response = JsonUtility.FromJson<ServerResponse>(responseText);
                     
                     if (response != null && response.status == "ok")
@@ -1296,7 +1186,6 @@ public class VideoRecorder : MonoBehaviour
                         bool responseHasScoreField = responseText.Contains("\"score\"");
                         float resolvedReward = responseHasScoreField ? response.score : response.reward;
 
-                        // Distribute reward (score) to all subscribed agents
                         BroadcastReward(episodeNumber, resolvedReward);
 
                         if (OnRewardReceived == null && OnServerScoreReceived == null)
@@ -1316,7 +1205,6 @@ public class VideoRecorder : MonoBehaviour
                     {
                         Debug.LogError($"[VideoRecorder] Server returned error status for episode {episodeNumber}: {responseText}");
                         
-                        // エラーの場合でも同期のため0報酬を配信
                         BroadcastReward(episodeNumber, 0f);
                         Debug.Log($"[VideoRecorder] Episode {episodeNumber}: Distributed default reward 0 due to server error");
                     }
@@ -1325,7 +1213,6 @@ public class VideoRecorder : MonoBehaviour
                 {
                     Debug.LogError($"[VideoRecorder] Failed to parse server response for episode {episodeNumber}: {ex.Message}");
                     
-                    // パース失敗でも同期のため0報酬を配信
                     BroadcastReward(episodeNumber, 0f);
                     Debug.Log($"[VideoRecorder] Episode {episodeNumber}: Distributed default reward 0 due to parse error");
                 }
@@ -1342,24 +1229,20 @@ public class VideoRecorder : MonoBehaviour
                         Debug.Log($"[VideoRecorder] Response body: {request.downloadHandler.text}");
                     }
                 }
-                
-                // ネットワークエラーの場合でも同期のため0報酬を配信
+
                 BroadcastReward(episodeNumber, 0f);
                 Debug.Log($"[VideoRecorder] Episode {episodeNumber}: Distributed default reward 0 due to network error");
             }
         }
     }
 
-    /// <summary>
-    /// Server response data structure - サーバーの実際のレスポンス形式に合わせる
-    /// </summary>
     [System.Serializable]
     private class ServerResponse
     {
-        public string status;        // "ok" or error status
-        public int episode_number;   // サーバーから返されるエピソード番号
-        public float reward;         // 計算された報酬値
-        public float score;          // server_videomae_api 互換: 平均コサイン類似度
+        public string status;
+        public int episode_number;
+        public float reward;
+        public float score;          // 平均コサイン類似度
     }
 
     private void PersistUploadedVideo(string sourcePath, int episodeNumber)

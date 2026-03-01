@@ -2,26 +2,18 @@ using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
 
-/// <summary>
-/// Moves a camera along the GeneticAlgorithmManager spawn radius and keeps it pointed
-/// toward the average spawned position.
-/// </summary>
 public class SpawnAwareCameraController : MonoBehaviour
 {
-    [SerializeField] private float moveDurationSeconds = 3f;
-    [SerializeField, Tooltip("Maximum distance allowed between camera and focus point.")] private float maxDistanceToFocus = 10f;
-    [SerializeField, Tooltip("Camera pitch angle in degrees to look slightly below the average position.")]
-    [Range(0f, 45f)] private float lookDownAngleDegrees = 5f;
-    [SerializeField, Tooltip("VideoRecorder component used to capture MP4 clips per segment.")] private VideoRecorder videoRecorder;
-    [SerializeField, Tooltip("GeneticAlgorithmManager that orchestrates sequential gene evaluations (optional).")] 
-    private GeneticAlgorithmManager geneticAlgorithmManager;
-    [SerializeField, Tooltip("Extra seconds to wait after the camera stops moving before restarting recording.")] private float recordingTailSeconds = 0.5f;
-    [SerializeField, Tooltip("Maximum seconds to wait for the server score before continuing. Set to 0 for no timeout.")] private float serverScoreTimeoutSeconds = 180f;
-    [SerializeField, Tooltip("Track the actual boid cluster center immediately, even before the first recording.")]
-    private bool prioritizeAgentCenter = true;
-    [SerializeField, Tooltip("Seconds to wait before repositioning the camera for each evaluation.")] private float preMoveDelaySeconds = 3f;
-    [SerializeField, Tooltip("Desired recording duration (seconds) enforced on the VideoRecorder before each capture.")] private float enforcedRecordingDurationSeconds = 5f;
-    [SerializeField, Tooltip("Desired recording frame rate enforced on the VideoRecorder before each capture.")] private int enforcedRecordingFrameRate = 15;
+    private float moveDurationSeconds = 3f;
+    [SerializeField, Range(0f, 45f)] private float lookDownAngleDegrees = 5f;
+    [SerializeField] private VideoRecorder videoRecorder;
+    [SerializeField] private GeneticAlgorithmManager geneticAlgorithmManager;
+    [SerializeField] private float recordingTailSeconds = 0.5f;
+    [SerializeField] private float serverScoreTimeoutSeconds = 180f;
+    [SerializeField] private bool prioritizeAgentCenter = true;
+    [SerializeField] private float preMoveDelaySeconds = 3f;
+    [SerializeField] private float enforcedRecordingDurationSeconds = 5f;
+    [SerializeField] private int enforcedRecordingFrameRate = 15;
 
     private Coroutine initializationRoutine;
     private Coroutine evaluationRoutine;
@@ -166,13 +158,11 @@ public class SpawnAwareCameraController : MonoBehaviour
     private IEnumerator SetupAndBeginLoop()
     {
         yield return new WaitUntil(IsSpawnContextReady);
-        LogStatus("Spawn data ready. Aligning camera before first recording.");
 
         EnsureVideoRecorderReference();
 
         if (videoRecorder == null)
         {
-            Debug.LogWarning("[SpawnAwareCameraController] Missing VideoRecorder. Camera loop will not start.");
             initializationComplete = true;
             initializationRoutine = null;
             yield break;
@@ -182,11 +172,9 @@ public class SpawnAwareCameraController : MonoBehaviour
         if (configuredFrames > 0 && configuredFrames != 75 && !warnedFrameCountMismatch)
         {
             warnedFrameCountMismatch = true;
-            Debug.LogWarning($"[SpawnAwareCameraController] VideoRecorder is configured for {configuredFrames} frames per segment. Expected 75 frames (5 seconds @ 15 FPS) to match the GA evaluation spec.");
         }
 
         yield return EnsureCameraPosition(true, prioritizeAgentCenter);
-        LogStatus("Camera aligned with agent cluster.");
 
         hasAlignedOnce = true;
         initializationComplete = true;
@@ -220,7 +208,6 @@ public class SpawnAwareCameraController : MonoBehaviour
 
         if (videoRecorder == null)
         {
-            Debug.LogWarning("[SpawnAwareCameraController] VideoRecorder not assigned. Evaluation recording cannot proceed.");
             evaluationRoutine = null;
             yield break;
         }
@@ -231,7 +218,6 @@ public class SpawnAwareCameraController : MonoBehaviour
             if (framesPerSegment > 0 && framesPerSegment != 75)
             {
                 warnedFrameCountMismatch = true;
-                Debug.LogWarning($"[SpawnAwareCameraController] VideoRecorder is configured for {framesPerSegment} frames per segment. Expected 75 frames (5 seconds @ 15 FPS) to match the GA evaluation spec.");
             }
         }
 
@@ -351,7 +337,6 @@ public class SpawnAwareCameraController : MonoBehaviour
         waitingForServerScore = false;
         int timedOutEpisode = pendingScoreEpisode;
         pendingScoreEpisode = -1;
-        Debug.LogWarning($"[SpawnAwareCameraController] Timed out waiting for server score (episode {timedOutEpisode}). Waiting for GA timeout fallback.");
         yield break;
     }
 
@@ -373,9 +358,7 @@ public class SpawnAwareCameraController : MonoBehaviour
 
     private IEnumerator MoveCameraTo(Vector3 averageWorld, bool instantMove)
     {
-        Vector3 targetPosition = ComputeClosestPointOnCircle(averageWorld);
-        targetPosition.y = ComputeTargetHeight(averageWorld);
-        targetPosition = ClampDistanceToFocus(targetPosition, averageWorld);
+        Vector3 targetPosition = averageWorld;
 
         float duration = instantMove ? 0f : Mathf.Max(0.01f, moveDurationSeconds);
         if (duration <= 0f)
@@ -407,7 +390,6 @@ public class SpawnAwareCameraController : MonoBehaviour
 
         if (videoRecorder == null)
         {
-            Debug.LogWarning("[SpawnAwareCameraController] VideoRecorder not assigned. Recording loop cannot continue.");
             yield break;
         }
 
@@ -441,67 +423,10 @@ public class SpawnAwareCameraController : MonoBehaviour
         }
 
         videoRecorder.StartRecording();
-        LogStatus("StartRecording invoked on VideoRecorder.");
 
         yield return null;
 
         startRequestPending = false;
-    }
-
-    private float ComputeTargetHeight(Vector3 averageWorld)
-    {
-        if (geneticAlgorithmManager == null)
-        {
-            return averageWorld.y;
-        }
-
-        Transform managerTransform = geneticAlgorithmManager.transform;
-        Vector3 bottomWorld = managerTransform.TransformPoint(Vector3.zero);
-        Vector3 topWorld = managerTransform.TransformPoint(new Vector3(0f, geneticAlgorithmManager.spawnHeight, 0f));
-        float minY = Mathf.Min(bottomWorld.y, topWorld.y);
-        float maxY = Mathf.Max(bottomWorld.y, topWorld.y);
-        return Mathf.Clamp(averageWorld.y, minY, maxY);
-    }
-
-    private Vector3 ComputeClosestPointOnCircle(Vector3 averageWorld)
-    {
-        if (geneticAlgorithmManager == null)
-        {
-            return averageWorld;
-        }
-
-        Vector3 centerWorld = geneticAlgorithmManager.transform.position;
-        float radius = Mathf.Max(0.1f, geneticAlgorithmManager.spawnRange);
-
-        Vector3 direction = averageWorld - centerWorld;
-        direction.y = 0f;
-
-        if (direction.sqrMagnitude < 0.0001f)
-        {
-            direction = Vector3.forward;
-        }
-
-        direction.Normalize();
-        return centerWorld + direction * radius;
-    }
-
-    private Vector3 ClampDistanceToFocus(Vector3 desiredPosition, Vector3 focusPoint)
-    {
-        float maxDistance = Mathf.Max(0.1f, maxDistanceToFocus);
-        Vector3 offset = desiredPosition - focusPoint;
-        float currentDistance = offset.magnitude;
-
-        if (currentDistance <= maxDistance)
-        {
-            return desiredPosition;
-        }
-
-        if (currentDistance < 0.0001f)
-        {
-            return focusPoint + Vector3.back * maxDistance;
-        }
-
-        return focusPoint + offset / currentDistance * maxDistance;
     }
 
     private bool TryGetAverage(out Vector3 averageWorld, bool requireAgentAverage)
@@ -646,7 +571,16 @@ public class SpawnAwareCameraController : MonoBehaviour
         Vector3 toFocus = adjustedFocus - transform.position;
         if (toFocus.sqrMagnitude < 0.0001f)
         {
-            return;
+            if (geneticAlgorithmManager != null)
+            {
+                Vector3 managerCenter = geneticAlgorithmManager.transform.position;
+                toFocus = managerCenter - transform.position;
+            }
+
+            if (toFocus.sqrMagnitude < 0.0001f)
+            {
+                return;
+            }
         }
 
         Quaternion lookRotation = Quaternion.LookRotation(toFocus, Vector3.up);

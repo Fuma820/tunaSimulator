@@ -2,53 +2,28 @@ using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
 
-/// <summary>
-/// Follows the average position of all active <see cref="TunaBoid"/> agents while
-/// optionally orbiting around them, and records short video clips without any
-/// server-side integration.
-/// </summary>
 [RequireComponent(typeof(Camera))]
 public class TunaBoidCameraRecorder : MonoBehaviour
 {
-    [Header("Boid Tracking")]
     [SerializeField] private bool autoFindBoids = true;
     private readonly List<TunaBoid> trackedBoids = new();
 
-    [Header("Camera Motion")]
     [SerializeField] private Camera targetCamera;
-    [SerializeField] private float followDistance = 14f;
-    [SerializeField, Tooltip("Smooth damp time for camera movement.")]
-    private float positionSmoothTime = 0f;
-    [SerializeField, Tooltip("Orbit speed around the centroid in degrees/second. Set to 0 to disable orbiting.")]
-    private float orbitDegreesPerSecond = 15f;
-    [SerializeField, Tooltip("How quickly the camera rotates to face the boid cluster.")]
-    private float lookLerpSpeed = 6f;
-    [SerializeField, Tooltip("Seconds between camera repositioning events.")]
-    private float movementIntervalSeconds = 5f;
-    [SerializeField, Tooltip("Duration of each camera move toward the new centroid.")]
-    private float movementDurationSeconds = 0f;
-    [SerializeField, Tooltip("If true, LateUpdate keeps tracking continuously in addition to the 5-second moves.")]
-    private bool continuousTracking = false;
-    [SerializeField, Tooltip("Optional object generator used to derive spawn positions for camera placement.")]
-    private ObjectGenerator objectGenerator;
-    [SerializeField, Tooltip("Maximum distance allowed between camera and boid focus point.")]
-    private float maxDistanceToFocus = 20f;
-    [SerializeField, Tooltip("Camera pitch angle to look slightly below the focus point.")]
-    [Range(0f, 45f)] private float lookDownAngleDegrees = 5f;
+    [SerializeField] private float positionSmoothTime = 0f;
+    [SerializeField] private float lookLerpSpeed = 6f;
+    [SerializeField] private float movementIntervalSeconds = 5f;
+    [SerializeField] private float movementDurationSeconds = 0f;
+    [SerializeField] private bool continuousTracking = false;
 
-    [Header("Recording")]
     [SerializeField] private bool autoStartRecordingOnPlay = false;
     [SerializeField] private bool loopRecording = true;
-    [SerializeField, Tooltip("VideoRecorder component responsible for saving the clip. Automatically discovered if left empty.")]
-    private VideoRecorder videoRecorder;
-    [SerializeField, Tooltip("Extra seconds to wait after the VideoRecorder finishes before the next move/record cycle begins.")]
-    private float recordingTailSeconds = 0.5f;
+    [SerializeField] private VideoRecorder videoRecorder;
+    [SerializeField] private float recordingTailSeconds = 0.5f;
 
     private readonly List<TunaBoid> boidCache = new();
     private Vector3 followVelocity;
     private Coroutine timedRoutine;
     private Coroutine refreshRoutine;
-    private float currentOrbitAngle;
     private bool cameraMidMove;
 
     private void Awake()
@@ -115,21 +90,9 @@ public class TunaBoidCameraRecorder : MonoBehaviour
         MoveCamera(centroid);
     }
 
-    /// <summary>
-    /// Manually refreshes the tracked boid list.
-    /// </summary>
     public void RefreshTrackedBoids()
     {
         trackedBoids.RemoveAll(b => b == null);
-        if (objectGenerator != null)
-        {
-            PopulateBoidsFromGenerator();
-            if (trackedBoids.Count > 0 || !autoFindBoids)
-            {
-                return;
-            }
-        }
-
         if (!autoFindBoids)
         {
             return;
@@ -141,9 +104,6 @@ public class TunaBoidCameraRecorder : MonoBehaviour
         trackedBoids.AddRange(boidCache);
     }
 
-    /// <summary>
-    /// Begins recording a new clip.
-    /// </summary>
     public void StartRecording()
     {
         if (timedRoutine != null)
@@ -154,16 +114,12 @@ public class TunaBoidCameraRecorder : MonoBehaviour
         EnsureVideoRecorderReference();
         if (videoRecorder == null)
         {
-            UnityEngine.Debug.LogWarning("[TunaBoidCameraRecorder] Cannot start recording because no VideoRecorder is assigned.");
             return;
         }
 
         timedRoutine = StartCoroutine(PeriodicMoveAndRecordRoutine());
     }
 
-    /// <summary>
-    /// Stops the current recording loop (if any).
-    /// </summary>
     public void StopRecording()
     {
         if (timedRoutine != null)
@@ -194,12 +150,6 @@ public class TunaBoidCameraRecorder : MonoBehaviour
     {
         if (TryGetBoidAverage(out centroid))
         {
-            return true;
-        }
-
-        if (objectGenerator != null)
-        {
-            centroid = objectGenerator.transform.position;
             return true;
         }
 
@@ -236,34 +186,6 @@ public class TunaBoidCameraRecorder : MonoBehaviour
 
         centroid /= count;
         return true;
-    }
-
-    private void PopulateBoidsFromGenerator()
-    {
-        if (objectGenerator == null)
-        {
-            return;
-        }
-
-        trackedBoids.Clear();
-        foreach (Transform child in objectGenerator.transform)
-        {
-            if (child == null)
-            {
-                continue;
-            }
-
-            TunaBoid boid = child.GetComponent<TunaBoid>();
-            if (boid == null)
-            {
-                boid = child.GetComponentInChildren<TunaBoid>();
-            }
-
-            if (boid != null)
-            {
-                trackedBoids.Add(boid);
-            }
-        }
     }
 
     private void MoveCamera(Vector3 centroid)
@@ -329,86 +251,11 @@ public class TunaBoidCameraRecorder : MonoBehaviour
 
     private (Vector3 position, Quaternion rotation) ComputeCameraGoal(Vector3 centroid, float deltaSeconds)
     {
-        Vector3 focusPoint = centroid;
-        Vector3 orbitCenter = objectGenerator != null
-            ? GetGeneratorCenterWorld()
-            : focusPoint;
-        float orbitRadius = Mathf.Max(0.1f, followDistance);
-
-        Vector3 planarPoint = ComputeNearestPointOnCircle(orbitCenter, orbitRadius, focusPoint, deltaSeconds);
-        planarPoint = ClampDistanceToFocus(planarPoint, focusPoint);
-
-        float horizontalDistance = new Vector2(planarPoint.x - focusPoint.x, planarPoint.z - focusPoint.z).magnitude;
-        float heightOffset = ComputeHeightOffset(horizontalDistance);
-        planarPoint.y = focusPoint.y + heightOffset;
-
-        Quaternion targetRotation = BuildLookRotation(planarPoint, focusPoint);
-        return (planarPoint, targetRotation);
+        Vector3 targetPosition = centroid;
+        Quaternion targetRotation = BuildLookRotation(transform.position, centroid);
+        return (targetPosition, targetRotation);
     }
 
-    private Vector3 GetGeneratorCenterWorld()
-    {
-        if (objectGenerator == null)
-        {
-            return transform.position;
-        }
-
-        return objectGenerator.transform.position;
-    }
-
-    private Vector3 ComputeNearestPointOnCircle(Vector3 circleCenter, float radius, Vector3 focusPoint, float deltaSeconds)
-    {
-        Vector3 direction = focusPoint - circleCenter;
-        direction.y = 0f;
-
-        if (direction.sqrMagnitude < 0.0001f)
-        {
-            Vector3 fallback = transform.position - circleCenter;
-            fallback.y = 0f;
-            if (fallback.sqrMagnitude > 0.0001f)
-            {
-                direction = fallback;
-            }
-            else
-            {
-                currentOrbitAngle += orbitDegreesPerSecond * Mathf.Max(0f, deltaSeconds);
-                direction = Quaternion.Euler(0f, currentOrbitAngle, 0f) * Vector3.forward;
-            }
-        }
-
-        direction.Normalize();
-        Vector3 point = circleCenter + direction * radius;
-        point.y = circleCenter.y;
-        return point;
-    }
-
-    private Vector3 ClampDistanceToFocus(Vector3 desiredPosition, Vector3 focusPoint)
-    {
-        if (maxDistanceToFocus <= 0f)
-        {
-            return desiredPosition;
-        }
-
-        float maxDistance = Mathf.Max(0.1f, maxDistanceToFocus);
-        Vector3 planarOffset = new Vector3(desiredPosition.x - focusPoint.x, 0f, desiredPosition.z - focusPoint.z);
-        float currentDistance = planarOffset.magnitude;
-
-        if (currentDistance <= maxDistance)
-        {
-            return desiredPosition;
-        }
-
-        if (currentDistance < 0.0001f)
-        {
-            planarOffset = Vector3.forward * maxDistance;
-        }
-        else
-        {
-            planarOffset = planarOffset / currentDistance * maxDistance;
-        }
-
-        return new Vector3(focusPoint.x + planarOffset.x, desiredPosition.y, focusPoint.z + planarOffset.z);
-    }
 
     private Quaternion BuildLookRotation(Vector3 cameraPosition, Vector3 focusPoint)
     {
@@ -422,21 +269,10 @@ public class TunaBoidCameraRecorder : MonoBehaviour
         return Quaternion.LookRotation(direction, Vector3.up);
     }
 
-    private float ComputeHeightOffset(float horizontalDistance)
-    {
-        if (lookDownAngleDegrees <= 0f)
-        {
-            return 0f;
-        }
-
-        return Mathf.Tan(Mathf.Deg2Rad * lookDownAngleDegrees) * horizontalDistance;
-    }
-
     private IEnumerator CaptureClipOnce()
     {
         if (targetCamera == null)
         {
-            UnityEngine.Debug.LogWarning("[TunaBoidCameraRecorder] Missing camera reference.");
             yield break;
         }
 
@@ -444,7 +280,6 @@ public class TunaBoidCameraRecorder : MonoBehaviour
 
         if (videoRecorder == null)
         {
-            UnityEngine.Debug.LogWarning("[TunaBoidCameraRecorder] VideoRecorder not found. Recording skipped.");
             yield break;
         }
 

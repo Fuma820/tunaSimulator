@@ -136,18 +136,9 @@ public class GeneticBoidAgent : MonoBehaviour
         Vector3 cohesion = CalculateCohesion() * cohesionWeight;
 
         Vector3 targetDirection = transform.forward;
-
         if (nearbyAgents.Count > 0 || nearbyObstacles.Count > 0)
         {
             targetDirection = separation + alignment + cohesion;
-        }
-
-        targetDirection.y = 0f;
-
-        if (targetDirection.sqrMagnitude < 0.0001f)
-        {
-            targetDirection = transform.forward;
-            targetDirection.y = 0f;
         }
 
         if (targetDirection.sqrMagnitude > 0.0001f)
@@ -155,6 +146,8 @@ public class GeneticBoidAgent : MonoBehaviour
             targetDirection.Normalize();
             Quaternion targetRotation = Quaternion.LookRotation(targetDirection, Vector3.up);
             transform.rotation = Quaternion.Slerp(transform.rotation, targetRotation, maxRotationSpeed * Time.fixedDeltaTime);
+        } else {
+            targetDirection = transform.forward;
         }
 
         rBody.velocity = transform.forward * baseSpeed;
@@ -254,11 +247,6 @@ public class GeneticBoidAgent : MonoBehaviour
         {
             avgVelocity /= count;
             Vector3 desired = avgVelocity - rBody.velocity;
-            desired.y = 0f;
-            if (desired.sqrMagnitude < 0.0001f)
-            {
-                return Vector3.zero;
-            }
             return desired.normalized;
         }
 
@@ -343,11 +331,6 @@ public class GeneticBoidAgent : MonoBehaviour
         {
             centerOfMass /= count;
             Vector3 towardsCenter = centerOfMass - transform.position;
-            towardsCenter.y = 0f;
-            if (towardsCenter.sqrMagnitude < 0.0001f)
-            {
-                return Vector3.zero;
-            }
             return towardsCenter.normalized;
         }
 
@@ -403,18 +386,9 @@ public class GeneticBoidAgent : MonoBehaviour
         if (distance > Mathf.Epsilon)
         {
             direction = offset / Mathf.Max(distance, 0.0001f);
-        }
-        else if (fallbackDirection.sqrMagnitude > 0.0001f)
-        {
+        } else if (fallbackDirection.sqrMagnitude > 0.0001f) {
             direction = fallbackDirection.normalized;
-        }
-        else
-        {
-            direction = Vector3.zero;
-        }
-
-        if (direction.sqrMagnitude < 0.0001f)
-        {
+        } else {
             return false;
         }
 

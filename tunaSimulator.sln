@@ -1,0 +1,25 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 11.00
+# Visual Studio 2010
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "MTE_script", "MTE_script.csproj", "{2a1650c7-3f73-2c22-0380-ab2fd646eb85}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Assembly-CSharp", "Assembly-CSharp.csproj", "{c61e3136-95f8-390b-8513-819f82371fa0}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Assembly-CSharp-Editor", "Assembly-CSharp-Editor.csproj", "{f6ac4734-e8bc-2092-5262-77c634cc37aa}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{2a1650c7-3f73-2c22-0380-ab2fd646eb85}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{2a1650c7-3f73-2c22-0380-ab2fd646eb85}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{c61e3136-95f8-390b-8513-819f82371fa0}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{c61e3136-95f8-390b-8513-819f82371fa0}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{f6ac4734-e8bc-2092-5262-77c634cc37aa}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{f6ac4734-e8bc-2092-5262-77c634cc37aa}.Debug|Any CPU.Build.0 = Debug|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+EndGlobal

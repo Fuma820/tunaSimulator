@@ -1,540 +1,239 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
-from fastapi import UploadFile, File, Form
-from fastapi.middleware.cors import CORSMiddleware
-import os
-import sys
-import tempfile
-from typing import Optional
 import asyncio
-import time
-import logging
-from datetime import datetime
+import glob
+import os
+import tempfile
 import threading
+import time
+import cv2
+from typing import Dict, List
+
 import numpy as np
+import torch
+from decord import VideoReader, cpu
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from transformers import VideoMAEImageProcessor, VideoMAEModel
 
-try:
-    import torch
-except Exception:  # pragma: no cover - environment may lack torch
-    torch = None
+REAL_VIDEO_DIR = os.getenv(
+    "REAL_VIDEO_DATASET_DIR",
+    "boids-0.1-0.1-1"
+)
+MODEL_NAME = os.getenv("VIDEOMAE_MODEL_NAME", "MCG-NJU/videomae-base")
+NUM_FRAMES = int(os.getenv("VIDEOMAE_FRAME_COUNT", "16"))
+MAX_FILE_SIZE = 100 * 1024 * 1024 
+UPLOAD_TIMEOUT = 120
 
-try:
-    import cv2
-except Exception:  # pragma: no cover - environment may lack opencv
-    cv2 = None
+_processor: VideoMAEImageProcessor | None = None
+_model: VideoMAEModel | None = None
+_device: torch.device | None = None
+_model_lock = threading.Lock()
 
-try:
-    from transformers import VideoMAEImageProcessor, VideoMAEForVideoClassification
-    TRANSFORMERS_AVAILABLE = True
-except Exception:  # pragma: no cover - transformers may be missing
-    VideoMAEImageProcessor = None
-    VideoMAEForVideoClassification = None
-    TRANSFORMERS_AVAILABLE = False
+_dataset_vectors: Dict[str, torch.Tensor] = {}
+_dataset_signature: tuple | None = None
+_dataset_lock = threading.Lock()
 
-"""SAM2 video segmentation support is disabled; classify raw clips directly."""
-SAM2_AVAILABLE = False
-build_sam2_video_predictor_hf = None
-SAM2AutomaticMaskGenerator = None
+def load_video_frames(path: str, num_frames: int = NUM_FRAMES) -> np.ndarray:
+    vr = VideoReader(path, ctx=cpu(0))
+    total_frames = len(vr)
+    if total_frames == 0:
+        raise RuntimeError(f"Video {path} has no frames")
 
-# ログ設定
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+    if total_frames < num_frames:
+        indices = np.linspace(0, total_frames - 1, total_frames).astype(int)
+    else:
+        indices = np.linspace(0, total_frames - 1, num_frames).astype(int)
 
-app = FastAPI(title="Fish Agent Reward Server", version="1.0")
+    frames = vr.get_batch(indices).asnumpy()
+    frames = frames.transpose(0, 3, 1, 2)
+    return frames
 
-# CORS設定 - Unity からのアクセスを許可
+
+def ensure_model_loaded() -> None:
+    global _processor, _model, _device
+    if _model is not None:
+        return
+
+    with _model_lock:
+        if _model is not None:
+            return
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        processor = VideoMAEImageProcessor.from_pretrained(MODEL_NAME)
+        model = VideoMAEModel.from_pretrained(MODEL_NAME)
+        model.to(device)
+        model.eval()
+
+        _processor = processor
+        _model = model
+        _device = device
+
+
+def video_to_vector(video_path: str) -> torch.Tensor:
+    ensure_model_loaded()
+    assert _processor is not None and _model is not None and _device is not None
+
+    frames = load_video_frames(video_path, NUM_FRAMES)
+    frames = grayscale_opencv(frames)
+
+    inputs = _processor(list(frames), return_tensors="pt")
+    inputs = {k: v.to(_device) for k, v in inputs.items()}
+
+    with torch.no_grad():
+        outputs = _model(**inputs)
+        vec = outputs.last_hidden_state.mean(dim=1).squeeze(0).cpu()
+    return vec
+
+
+def cosine_similarity(vec1: torch.Tensor, vec2: torch.Tensor) -> float:
+    return torch.nn.functional.cosine_similarity(vec1, vec2, dim=0).item()
+
+
+def _scan_dataset() -> List[str]:
+    return sorted(glob.glob(os.path.join(REAL_VIDEO_DIR, "*.mp4")))
+
+
+def ensure_real_vectors() -> Dict[str, torch.Tensor]:
+    global _dataset_vectors, _dataset_signature
+
+    video_paths = _scan_dataset()
+    signature = tuple((path, os.path.getmtime(path)) for path in video_paths)
+
+    with _dataset_lock:
+        if not video_paths:
+            _dataset_vectors = {}
+            _dataset_signature = signature
+            return _dataset_vectors
+
+        if _dataset_signature == signature and _dataset_vectors:
+            return _dataset_vectors
+
+        vectors: Dict[str, torch.Tensor] = {}
+        for path in video_paths:
+            vectors[path] = video_to_vector(path)
+
+        _dataset_vectors = vectors
+        _dataset_signature = signature
+        return _dataset_vectors
+
+def grayscale_opencv(frames: np.ndarray) -> np.ndarray:
+    gray_frames = []
+
+    for frame in frames:
+        frame_hwc = frame.transpose(1, 2, 0)
+        frame_bgr = cv2.cvtColor(frame_hwc, cv2.COLOR_RGB2BGR)
+
+        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        gray_3ch = np.stack([gray, gray, gray], axis=-1)
+        gray_chw = gray_3ch.transpose(2, 0, 1)
+        gray_frames.append(gray_chw)
+
+    return np.stack(gray_frames, axis=0).astype(frames.dtype)
+
+app = FastAPI(title="VideoMAE Similarity Server", version="1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    allow_credentials=True,
 )
-
-# グローバル設定
-MAX_FILE_SIZE = 100 * 1024 * 1024  # 100MB
-UPLOAD_TIMEOUT = 120  # 120秒
-
-# ログファイル設定
-LOG_DIR = "video_analysis_logs"
-SCORE_LOG_FILE = os.path.join(LOG_DIR, "video_scores.txt")
-
-# ログディレクトリを作成
-os.makedirs(LOG_DIR, exist_ok=True)
-
-"""SAM2 segmentation parameters disabled
-SEGMENT_MODEL_ID = os.getenv("SAM2_MODEL_ID", "facebook/sam2.1-hiera-large")
-SEGMENT_MAX_WIDTH = int(os.getenv("SAM2_MAX_WIDTH", "640"))
-SEGMENT_BACKGROUND_RATIO = float(os.getenv("SAM2_BACKGROUND_RATIO", "0.1"))
-SEGMENT_OBJECT_COLOR = (0, 255, 0)
-"""
-
-VIDEO_CLASS_MODEL_PATH = os.getenv(
-    "VIDEO_CLASS_MODEL_PATH",
-    os.path.join(os.path.dirname(__file__), "finetune_output_tuna_vs_other/checkpoint-825"),
-)
-VIDEO_CLASS_BASE_MODEL = os.getenv("VIDEO_CLASS_BASE_MODEL", "MCG-NJU/videomae-base")
-VIDEO_CLASS_FRAME_COUNT = int(os.getenv("VIDEO_CLASS_FRAME_COUNT", "16"))
-VIDEO_CLASS_NAMES = ["simulator1","simulator2","simulator3", "real"]
-
-# モデルキャッシュとロック
-sam2_predictor = None
-sam2_mask_generator = None
-sam2_device = None
-sam2_init_lock = threading.Lock()
-sam2_infer_lock = threading.Lock()
-
-video_processor = None
-video_classifier = None
-video_device = None
-video_init_lock = threading.Lock()
-video_infer_lock = threading.Lock()
-
-
-def get_device_summary() -> dict:
-    """現在利用可能なGPU/デバイス情報を返す"""
-    summary = {
-        "torch_available": torch is not None,
-        "cuda_available": False,
-        "gpu_name": None,
-        "sam2_device": str(sam2_device) if sam2_device is not None else None,
-        "video_classifier_device": str(video_device) if video_device is not None else None,
-    }
-
-    if torch is None:
-        return summary
-
-    cuda_available = torch.cuda.is_available()
-    summary["cuda_available"] = cuda_available
-
-    if cuda_available:
-        try:
-            summary["gpu_name"] = torch.cuda.get_device_name(0)
-        except Exception as exc:
-            summary["gpu_name"] = f"cuda device (name unavailable: {exc})"
-
-    return summary
-
-def log_video_received(
-    episode_number: int,
-    file_size: int,
-    attempt_number: int = 1,
-    filename: str | None = None,
-):
-    """受信した映像のメタ情報をスコアログに残す"""
-    try:
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        entry = (
-            f"{timestamp} | Episode: {episode_number:4d} | Attempt: {attempt_number} | "
-            f"Size: {file_size/1024/1024:6.2f}MB | Event: RECEIVED"
-        )
-        if filename:
-            entry += f" | File: {filename}"
-        entry += "\n"
-
-        with open(SCORE_LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(entry)
-
-        logger.info(
-            "Log entry added for received video (episode=%s, attempt=%s, size=%.2fMB)",
-            episode_number,
-            attempt_number,
-            file_size / 1024 / 1024,
-        )
-    except Exception as exc:
-        logger.error(f"Failed to log video reception: {exc}")
-
-
-def log_video_score(episode_number: int, file_size: int, score: float, analysis_time: float, attempt_number: int = 1):
-    """映像スコアをテキストファイルに記録"""
-    try:
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        log_entry = (
-            f"{timestamp} | Episode: {episode_number:4d} | "
-            f"Attempt: {attempt_number} | Size: {file_size/1024/1024:6.2f}MB | "
-            f"Score: {score:6.4f} | Analysis: {analysis_time:6.2f}s\n"
-        )
-        
-        # ログファイルに追記
-        with open(SCORE_LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(log_entry)
-        
-        logger.info(f"Score logged: Episode {episode_number}, Score {score:.4f}")
-        
-    except Exception as e:
-        logger.error(f"Failed to log score: {e}")
-
-def initialize_log_file():
-    """ログファイルの初期化（ヘッダー書き込み）"""
-    if not os.path.exists(SCORE_LOG_FILE):
-        try:
-            with open(SCORE_LOG_FILE, "w", encoding="utf-8") as f:
-                f.write("=" * 80 + "\n")
-                f.write("Fish Agent Video Analysis Score Log\n")
-                f.write(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-                f.write("=" * 80 + "\n")
-                f.write("Timestamp           | Episode | Attempt | Size(MB) | Score  | Analysis(s)\n")
-                f.write("-" * 80 + "\n")
-            logger.info(f"Initialized score log file: {SCORE_LOG_FILE}")
-        except Exception as e:
-            logger.error(f"Failed to initialize log file: {e}")
-
-
-"""SAM2 segmentation helpers are disabled.
-
-def get_sam2_components():
-    ...
-
-def classify_masks_by_area(...):
-    ...
-
-def segment_uploaded_video(...):
-    ...
-
-"""
-
-
-def get_video_classifier_components():
-    if not TRANSFORMERS_AVAILABLE or torch is None:
-        raise RuntimeError("Video classifier dependencies are not available")
-
-    global video_processor, video_classifier, video_device
-    with video_init_lock:
-        if video_classifier is None:
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            logger.info(f"Loading VideoMAE classifier on {device}...")
-            video_processor = VideoMAEImageProcessor.from_pretrained(VIDEO_CLASS_BASE_MODEL)
-            video_classifier = VideoMAEForVideoClassification.from_pretrained(
-                VIDEO_CLASS_MODEL_PATH,
-                local_files_only=True,
-            )
-            video_classifier.to(device)
-            video_classifier.eval()
-            video_device = device
-            logger.info("Video classifier ready")
-
-    return video_processor, video_classifier, video_device
-
-
-def load_video_frame_sequences(
-    video_path: str,
-    frame_count: int = VIDEO_CLASS_FRAME_COUNT,
-    sequence_count: int = 4,
-    size: tuple[int, int] = (224, 224),
-):
-    if cv2 is None:
-        return []
-
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        return []
-
-    processed_frames: list[np.ndarray] = []
-    try:
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            frame = cv2.resize(frame, size)
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            processed_frames.append(frame)
-    finally:
-        cap.release()
-
-    if not processed_frames:
-        return []
-
-    total_frames = len(processed_frames)
-
-    if total_frames < frame_count:
-        padding_frame = processed_frames[-1]
-        processed_frames.extend([padding_frame] * (frame_count - total_frames))
-        total_frames = len(processed_frames)
-
-    if sequence_count <= 1 or total_frames <= frame_count:
-        start_indices = [0]
-    else:
-        max_start = max(total_frames - frame_count, 0)
-        if sequence_count == 1 or max_start == 0:
-            start_indices = [0]
-        else:
-            start_indices = [
-                int(round(i * max_start / (sequence_count - 1)))
-                for i in range(sequence_count)
-            ]
-
-    sequences: list[list[np.ndarray]] = []
-    for start in start_indices:
-        end = start + frame_count
-        seq = processed_frames[start:end]
-        if len(seq) < frame_count and seq:
-            seq.extend([seq[-1]] * (frame_count - len(seq)))
-        sequences.append(seq)
-
-    return sequences
-
-
-def classify_segmented_video(video_path: str) -> float:
-    if not TRANSFORMERS_AVAILABLE or torch is None:
-        logger.warning("Video classifier not available; returning 0 score")
-        return 0.0
-
-    frame_sequences = load_video_frame_sequences(
-        video_path,
-        frame_count=VIDEO_CLASS_FRAME_COUNT,
-        sequence_count=4,
-    )
-    if not frame_sequences:
-        logger.warning("No frame sequences available for classification; returning 0 score")
-        return 0.0
-
-    try:
-        processor, classifier, device = get_video_classifier_components()
-    except Exception as exc:
-        logger.error(f"Failed to prepare video classifier: {exc}")
-        return 0.0
-
-    with video_infer_lock:
-        try:
-            scores: list[float] = []
-            for frames in frame_sequences:
-                if not frames:
-                    continue
-                inputs = processor(frames, return_tensors="pt")
-                inputs = {k: v.to(device) for k, v in inputs.items()}
-                with torch.no_grad():
-                    outputs = classifier(**inputs)
-                    probs = torch.softmax(outputs.logits, dim=-1)
-                if "real" in VIDEO_CLASS_NAMES:
-                    real_idx = VIDEO_CLASS_NAMES.index("real")
-                    score = float(probs[0, real_idx].cpu().item())
-                else:
-                    score = float(probs.max().cpu().item())
-                scores.append(score)
-
-            if scores:
-                return float(sum(scores) / len(scores))
-
-            logger.warning("Video classifier produced no scores; returning 0")
-            return 0.0
-        except Exception as exc:
-            logger.error(f"Video classification failed: {exc}")
-            return 0.0
-
-
-initialize_log_file()
-
-
-class SpeedRequest(BaseModel):
-    speed: float = Field(..., ge=0.0, description="Current agent speed magnitude")
-    min_speed: float = Field(..., ge=0.0, description="Minimum desired speed threshold")
-    penalty: float = Field(-0.1, description="Negative reward to apply when below min_speed")
-
-class RewardResponse(BaseModel):
-    reward: float
-    reason: Optional[str] = None
-
-# --- Episode finalize ---
-class FinalizeRequest(BaseModel):
-    episode_id: Optional[int] = None
-    average_speed: Optional[float] = None
-
-class FinalizeResponse(BaseModel):
-    status: str = "done"
-
-# --- Video upload ---
-class UploadResponse(BaseModel):
-    status: str
-    filename: str | None = None
-    episode_number: int | None = None
-    reward: float = 0.0
-
 
 @app.get("/health")
 async def health_check():
-    """ヘルスチェックエンドポイント - Unity側の接続テスト用"""
+    cuda_available = torch.cuda.is_available()
+    gpu_name = torch.cuda.get_device_name(0) if cuda_available else None
+    dataset_files = _scan_dataset()
     return {
-        "status": "ok", 
-        "message": "Server is running",
-        "timestamp": time.time(),
-        "max_file_size_mb": MAX_FILE_SIZE / 1024 / 1024,
-        "timeout_seconds": UPLOAD_TIMEOUT,
-        "gpu": get_device_summary(),
+        "status": "ok",
+        "gpu": {
+            "torch": torch.__version__,
+            "cuda_available": cuda_available,
+            "gpu_name": gpu_name,
+        },
+        "dataset_count": len(dataset_files),
+        "model": MODEL_NAME,
+        "frame_count": NUM_FRAMES,
+        "real_video_dir": os.path.abspath(REAL_VIDEO_DIR),
     }
 
-@app.post("/upload/video", response_model=UploadResponse)
+@app.post("/upload/video")
 async def upload_video(
     episode_number: int = Form(...),
     file: UploadFile = File(...),
     attempt_number: int = Form(default=1),
-    file_size: int = Form(default=0)
+    file_size: int = Form(default=0),
 ):
-    """改善された動画アップロードエンドポイント"""
+    start_time = time.time()
+
+    if file_size and file_size > MAX_FILE_SIZE:
+        raise HTTPException(status_code=413, detail="Uploaded file exceeds server limit")
+    if file.content_type and not file.content_type.startswith("video/"):
+        raise HTTPException(status_code=400, detail="Only video uploads are supported")
+
+    tmp_path = None
+    total_bytes = 0
     try:
-        start_time = time.time()
-        logger.info(f"Receiving upload: episode={episode_number}, attempt={attempt_number}, size={file_size}")
-        
-        # ファイルサイズチェック
-        if file_size > MAX_FILE_SIZE:
-            raise HTTPException(
-                status_code=413, 
-                detail=f"File too large: {file_size} bytes (max: {MAX_FILE_SIZE})"
-            )
-        
-        # ファイルタイプチェック
-        if file.content_type and not file.content_type.startswith('video/'):
-            raise HTTPException(
-                status_code=400, 
-                detail=f"Invalid file type: {file.content_type}"
-            )
-        
-        # 動画は永続保存せず、一時ファイルにストリーム書き込み→解析後に削除
-        tmp_path = None
-        total_size = 0
-        try:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
-                tmp_path = tmp.name
-                # チャンクで読み取り（メモリ使用量を抑える）
-                while True:
-                    try:
-                        # タイムアウト付きでチャンク読み込み
-                        chunk = await asyncio.wait_for(file.read(1024 * 1024), timeout=10)
-                        if not chunk:
-                            break
-                        tmp.write(chunk)
-                        total_size += len(chunk)
-                        
-                        # サイズ制限チェック
-                        if total_size > MAX_FILE_SIZE:
-                            raise HTTPException(status_code=413, detail="File too large during upload")
-                            
-                    except asyncio.TimeoutError:
-                        raise HTTPException(status_code=408, detail="File upload timeout")
-
-            logger.info(f"File saved to temp: {tmp_path}, size: {total_size} bytes")
-            log_video_received(
-                episode_number=episode_number,
-                file_size=total_size,
-                attempt_number=attempt_number,
-                filename=file.filename,
-            )
-
-            reward_value = 0.0
-            classification_target = tmp_path
-            analysis_start = time.time()
-            try:
-                logger.info("SAM segmentation disabled; classifying raw clip directly")
-                reward_value = await asyncio.to_thread(classify_segmented_video, classification_target)
-            except Exception as e:
-                logger.error(f"Video processing pipeline failed: {e}")
-                reward_value = 0.0
-            finally:
-                analysis_time = time.time() - analysis_start
-                logger.info(
-                    "Video analysis completed (target=raw): score=%.4f, time=%.2fs",
-                    reward_value,
-                    analysis_time,
-                )
-                log_video_score(episode_number, total_size, reward_value, analysis_time, attempt_number)
-            
-            upload_duration = time.time() - start_time
-            logger.info(f"Upload processed successfully in {upload_duration:.2f}s")
-            
-            # ファイル名は返さない（サーバには残さないため）
-            return UploadResponse(
-                status="ok", 
-                filename=None, 
-                episode_number=episode_number, 
-                reward=reward_value
-            )
-            
-        finally:
-            if tmp_path and os.path.exists(tmp_path):
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
+            tmp_path = tmp.name
+            while True:
                 try:
-                    os.remove(tmp_path)
-                    logger.info(f"Temp file cleaned up: {tmp_path}")
-                except Exception as e:
-                    logger.warning(f"Failed to clean up temp file: {e}")
-                    
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Upload error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+                    chunk = await asyncio.wait_for(file.read(1024 * 1024), timeout=10)
+                except asyncio.TimeoutError:
+                    raise HTTPException(status_code=408, detail="Upload timed out") from None
 
+                if not chunk:
+                    break
+                tmp.write(chunk)
+                total_bytes += len(chunk)
 
-# 新しいエンドポイント: サーバー状態確認用
-@app.get("/status")
-async def get_server_status():
-    """サーバー状態確認用"""
-    # ログファイルの統計情報を取得
-    log_stats = {"total_episodes": 0, "log_file_exists": False, "log_file_size": 0}
-    try:
-        if os.path.exists(SCORE_LOG_FILE):
-            log_stats["log_file_exists"] = True
-            log_stats["log_file_size"] = os.path.getsize(SCORE_LOG_FILE)
-            # エピソード数をカウント（簡易）
-            with open(SCORE_LOG_FILE, "r", encoding="utf-8") as f:
-                lines = f.readlines()
-                log_stats["total_episodes"] = len([line for line in lines if "Episode:" in line])
-    except Exception as e:
-        logger.warning(f"Failed to read log stats: {e}")
-    
-    return {
-        "server": "Fish Agent Reward Server",
-        "status": "running",
-        "uptime": time.time(),
-        "max_file_size_mb": MAX_FILE_SIZE / 1024 / 1024,
-        "timeout_seconds": UPLOAD_TIMEOUT,
-        "log_directory": LOG_DIR,
-        "score_log_file": SCORE_LOG_FILE,
-        "log_statistics": log_stats,
-        "gpu": get_device_summary(),
-        "endpoints": ["/health", "/upload/video", "/status", "/logs"]
-    }
+                if total_bytes > MAX_FILE_SIZE:
+                    raise HTTPException(status_code=413, detail="Uploaded file exceeds server limit")
 
-@app.get("/logs")
-async def get_recent_logs(lines: int = 50):
-    """最近のログエントリを取得"""
-    try:
-        if not os.path.exists(SCORE_LOG_FILE):
-            return {"message": "No log file found", "logs": []}
-        
-        with open(SCORE_LOG_FILE, "r", encoding="utf-8") as f:
-            all_lines = f.readlines()
-            recent_lines = all_lines[-lines:] if len(all_lines) > lines else all_lines
-            
+        if total_bytes == 0:
+            raise HTTPException(status_code=400, detail="Empty video upload")
+        real_vectors = await asyncio.to_thread(ensure_real_vectors)
+        if not real_vectors:
+            raise HTTPException(status_code=500, detail="real_video_dataset has no mp4 files")
+        sim_vec = await asyncio.to_thread(video_to_vector, tmp_path)
+
+        similarities = [cosine_similarity(vec, sim_vec) for vec in real_vectors.values()]
+        sims_np = np.array(similarities, dtype=np.float32)
+        score = float(sims_np.mean())
+
+        duration = time.time() - start_time
+        print(
+            f"[VideoMAE] Episode={episode_number} Attempt={attempt_number} Score={score:.4f}"
+        )
         return {
-            "total_lines": len(all_lines),
-            "showing_lines": len(recent_lines),
-            "logs": [line.strip() for line in recent_lines if line.strip()]
+            "status": "ok",
+            "episode_number": episode_number,
+            "attempt_number": attempt_number,
+            "score": score,
+            "stats": {
+                "count": len(similarities),
+                "max": float(sims_np.max()),
+                "min": float(sims_np.min()),
+                "mean": score,
+                "var": float(sims_np.var()),
+            },
+            "processing_seconds": duration,
         }
-    except Exception as e:
-        logger.error(f"Failed to read logs: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to read logs: {str(e)}")
+
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
 
 
-# For local testing: uvicorn server:app --reload --port 8000
 if __name__ == "__main__":
     import uvicorn
-    print("Starting Fish Agent Reward Server...")
-    print(f"Max file size: {MAX_FILE_SIZE / 1024 / 1024:.1f} MB")
-    print(f"Upload timeout: {UPLOAD_TIMEOUT} seconds")
-    print(f"Score log file: {SCORE_LOG_FILE}")
-    print("Available endpoints:")
-    print("  GET  /health  - Health check")
-    print("  GET  /status  - Server status")
-    print("  POST /upload/video - Video upload and analysis")
-    
-    # ログファイルを初期化
-    initialize_log_file()
-    
-    # 直接実行時に起動（reloadはOFF：importパス不要で安定）
-    uvicorn.run(
-        app, 
-        host="127.0.0.1", 
-        port=8000,
-        timeout_keep_alive=UPLOAD_TIMEOUT,
-        access_log=True
-    )
 
+    print("Starting VideoMAE similarity server...")
+    print(f"Dataset directory: {os.path.abspath(REAL_VIDEO_DIR)}")
+    uvicorn.run(
+        app,
+        host="127.0.0.1",
+        port=8000,
+        reload=False,
+    )

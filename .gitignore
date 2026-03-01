@@ -10,6 +10,8 @@ Recordings/
 Assets/Scripts/server/finetune_output_tuna_vs_other
 *.mp4
 *.mp4.meta
+Assets/Scripts/*.meta
+Assets/Scripts/server/*.meta
 Assets/Scripts/server/real_video_dataset.meta
 Assets/Scripts/server/grayscale_real_video_dataset.meta
 Assets/Scripts/server/__pycache__/*

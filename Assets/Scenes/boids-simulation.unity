@@ -2068,16 +2068,11 @@ MonoBehaviour:
   m_EditorClassIdentifier: 
   autoFindBoids: 1
   targetCamera: {fileID: 870610535}
-  followDistance: 14
   positionSmoothTime: 0
-  orbitDegreesPerSecond: 15
   lookLerpSpeed: 6
   movementIntervalSeconds: 5
   movementDurationSeconds: 0
   continuousTracking: 0
-  objectGenerator: {fileID: 1554092671}
-  maxDistanceToFocus: 8
-  lookDownAngleDegrees: 20
   autoStartRecordingOnPlay: 1
   loopRecording: 1
   videoRecorder: {fileID: 870610539}
@@ -2130,7 +2125,7 @@ MonoBehaviour:
   r: 0.15
   g: 0.4
   b: 0.55
-  density: 0.01
+  density: 0.5
 --- !u!1001 &899462439
 PrefabInstance:
   m_ObjectHideFlags: 0
@@ -3407,7 +3402,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: b8c5036318c454bb5b066a8de06ca20d, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  objectToSpawn: {fileID: 4105506564861623119, guid: b49e92f15f4024c418d85d000e733be7,
+  objectToSpawn: {fileID: 627803851687001208, guid: 17d89f4e7caf9f043967cf96c9be37a5,
     type: 3}
   numberOfObjects: 100
   spawnRadius: 14
